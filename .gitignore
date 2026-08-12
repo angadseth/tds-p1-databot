@@ -1,3 +1,5 @@
 test_run.jsonl
 __pycache__/
 .env
+__pycache__/
+.watch_state.json
