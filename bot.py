@@ -279,20 +279,28 @@ def looks_like_giveup(obj) -> bool:
 
 
 # ---------------------------------------------------------------- llm
+_send_temperature = True  # newer models reject temperature=0; learned on first 400
+
+
 def chat_completion(messages, use_tools=True):
-    body = {"model": MODEL, "messages": messages, "temperature": 0}
+    global _send_temperature
+    body = {"model": MODEL, "messages": messages}
+    if _send_temperature:
+        body["temperature"] = 0
     if use_tools:
         body["tools"] = TOOLS
-    r = requests.post(
-        f"{MODEL_BASE_URL}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {AIPIPE_TOKEN}",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (data-analyst-bot)",
-        },
-        json=body,
-        timeout=180,
-    )
+    headers = {
+        "Authorization": f"Bearer {AIPIPE_TOKEN}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (data-analyst-bot)",
+    }
+    url = f"{MODEL_BASE_URL}/chat/completions"
+    r = requests.post(url, headers=headers, json=body, timeout=180)
+    if r.status_code == 400 and "temperature" in r.text and _send_temperature:
+        _send_temperature = False
+        body.pop("temperature")
+        log_event(event="temperature_unsupported", model=MODEL)
+        r = requests.post(url, headers=headers, json=body, timeout=180)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]
 
