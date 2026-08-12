@@ -5,15 +5,32 @@ grader has been in touch:
 
     uv run --with requests python watch_bot.py
 
+Add --alert to also send a Telegram DM to the owner when something is wrong
+(needs BOT_TOKEN in the environment or in a .env file beside this script):
+
+    uv run --with requests python watch_bot.py --alert
+
 Exit code 0 = all clear, 1 = something needs attention (so it can drive a cron).
 """
 
 import datetime
+import hashlib
 import json
 import os
 import sys
 
 import requests
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Local-only secrets (BOT_TOKEN, RENDER_API_KEY) live in a gitignored .env.
+_envfile = os.path.join(HERE, ".env")
+if os.path.exists(_envfile):
+    for _line in open(_envfile, encoding="utf-8"):
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 BASE = "https://tds-p1-databot-v2.onrender.com"
 SERVICE = "srv-d9l2eg3m8hqs7394h8ig"
@@ -21,7 +38,7 @@ SERVICE = "srv-d9l2eg3m8hqs7394h8ig"
 # service. Never hardcode it — this repository is public.
 RENDER_KEY = os.environ.get("RENDER_API_KEY", "")
 OWNER_CHAT = 6239214943  # Angad's own Telegram chat — anything else is an outsider
-STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".watch_state.json")
+STATE = os.path.join(HERE, ".watch_state.json")
 
 # An "answer" that is really the agent giving up.
 BAD_WORDS = ("fail", "unable", "cannot", "could not", "couldn't", "no data",
@@ -68,13 +85,7 @@ def check_log():
     events = [json.loads(l) for l in txt.splitlines() if l.strip()]
     notes.append(f"log has {len(events)} lines")
 
-    seen = {}
-    if os.path.exists(STATE):
-        try:
-            seen = json.load(open(STATE))
-        except Exception:
-            seen = {}
-    last_n = seen.get("lines", 0)
+    last_n = _state.get("lines", 0)
     fresh = events[last_n:] if len(events) >= last_n else events
 
     # 1. Anyone other than Angad talking to the bot = the grader.
@@ -111,8 +122,36 @@ def check_log():
         notes.append(f"last event {idle:.0f} min ago")
         notes.append("SAFE TO REDEPLOY" if idle > 15 else "DO NOT REDEPLOY - a run may be in flight")
 
-    json.dump({"lines": len(events)}, open(STATE, "w"))
+    _state["lines"] = len(events)
 
+
+def alert(text: str):
+    """DM the owner through their own bot. Silent no-op without a token."""
+    token = os.environ.get("BOT_TOKEN", "")
+    if not token:
+        print("  (no BOT_TOKEN — cannot send the Telegram alert)")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": OWNER_CHAT, "text": text[:3900]}, timeout=45,
+        )
+        print(f"  (telegram alert sent: {r.json().get('ok')})")
+    except Exception as e:
+        print(f"  (telegram alert failed: {e})")
+
+
+if "--test-alert" in sys.argv:
+    alert("P1 DATABOT WATCH - test alert. If you can read this on your phone, "
+          "the 5-minute watchdog can reach you.")
+    sys.exit(0)
+
+_state: dict = {}
+if os.path.exists(STATE):
+    try:
+        _state = json.load(open(STATE))
+    except Exception:
+        _state = {}
 
 check_health()
 check_service()
@@ -127,4 +166,14 @@ if problems:
         print(f"  >>>  {p}")
 else:
     print("\nAll clear - no grader activity, no agent failures.")
+
+# Alert once per distinct situation, not every five minutes about the same one.
+fingerprint = hashlib.sha256("\n".join(problems).encode()).hexdigest() if problems else ""
+if "--alert" in sys.argv and problems and fingerprint != _state.get("alerted"):
+    alert("P1 DATABOT WATCH - needs attention\n\n" + "\n".join(problems))
+    _state["alerted"] = fingerprint
+elif not problems:
+    _state.pop("alerted", None)
+
+json.dump(_state, open(STATE, "w"))
 sys.exit(1 if problems else 0)

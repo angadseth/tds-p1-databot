@@ -99,7 +99,35 @@ def run_python(code: str, chat_id: int = 0) -> str:
         )
     with out_lock:
         text = out.getvalue()
-    return text[-8000:] if text else "(no output — use print())"
+    text = text[-8000:] if text else "(no output — use print())"
+    return text + fabrication_warning(code)
+
+
+# Phrases the model writes when it is about to invent its data. The prompt
+# forbids this, but a prompt alone does not stop it, so we also say so at the
+# moment it happens — as tool output, where it is hardest to ignore.
+FABRICATION_MARKERS = (
+    "simulated data", "simulate the data", "hypothetical", "for demonstration",
+    "for illustration", "example data", "let's assume we have", "assume we have",
+    "known statistics", "placeholder data", "dummy data", "sample data for",
+    "using known values", "from memory",
+)
+
+
+def fabrication_warning(code: str) -> str:
+    """Flag code that invents its own numbers instead of fetching them."""
+    low = code.lower()
+    if not any(m in low for m in FABRICATION_MARKERS):
+        return ""
+    if any(f in low for f in ("requests.get", "read_csv(", "read_html(", "urlopen")):
+        return ""  # it is still really fetching something
+    return (
+        "\n\n!!! WARNING: this code contains data you invented, not data you fetched. "
+        "Numbers recalled from memory are NOT evidence, and a max() over them is not a "
+        "computation — it is a guess that changes every run. Do NOT base the final answer "
+        "on it. Either fetch the real figures from a source you can verify, or state your "
+        "knowledge-based answer directly in the final JSON without staging a fake calculation."
+    )
 
 
 TOOLS = [
@@ -148,6 +176,22 @@ educated best guess in the right shape beats a perfect explanation of why you co
    {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
 7. Round as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for.
 
+## NEVER fabricate data (this is how wrong answers happen)
+Writing values you remember into a literal and computing on them is NOT computing — it is a guess
+wearing a computation's clothes, and it silently produces a different answer every time:
+    state_mmr = {"Kerala": 42, "Assam": 215, ...}   # FORBIDDEN: these numbers are invented
+    max(state_mmr, key=state_mmr.get)               # looks rigorous, means nothing
+If you could not fetch the real data, do NOT stage a fake calculation. Say the answer directly in
+the final JSON from your own knowledge of the published figure. Compute only on data you actually
+fetched and printed.
+
+## Check that you got data, not a web page
+Before parsing, print `r.status_code`, `r.headers.get("content-type")` and `r.text[:200]`.
+HTTP 200 with `text/html` where you expected CSV or JSON means the URL is WRONG — a portal error
+page, a login wall, or a link you half-remembered. Do not guess dataset URLs; a guessed URL that
+returns HTML is the usual first domino. Switch to a source you can verify (a documented API, a
+Wikipedia table via the API, the World Bank API) instead of inventing numbers.
+
 ## How to not fail at fetching
 An empty result is NOT proof the data is missing — it almost always means your identifier or filter
 was wrong. Before concluding anything is unavailable:
@@ -158,6 +202,10 @@ was wrong. Before concluding anything is unavailable:
 - WHO GHO OData (ghoapi.azureedge.net): SpatialDim holds ISO3 codes, and rows are split by dimension —
   e.g. Dim1 is SEX_BTSX (both sexes) / SEX_MLE / SEX_FMLE. Filter the dimension explicitly or you will
   silently mix series together.
+- Pass timeout=20 to EVERY network call. A hung request burns the whole budget. If a source fails
+  twice, stop retrying it and move to a different source.
+- Reachability differs by host: some sites answer from this server and others do not. Two failures
+  on one source is your signal to switch, not to try harder.
 - If a host or endpoint is dead, try an alternate source (World Bank API, the CSV download, Wikipedia)
   before falling back to knowledge.
 - Never call max()/min()/idxmax() on a collection you have not just printed and confirmed is non-empty.
