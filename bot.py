@@ -19,7 +19,6 @@ import re
 import threading
 import time
 import traceback
-import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -37,13 +36,16 @@ LOG_PATH = os.environ.get("LOG_PATH", "/tmp/run.jsonl")
 LOG_URL = f"{BASE_URL}/run.jsonl"
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-MAX_AGENT_STEPS = 10
+MAX_AGENT_STEPS = 14
 PY_TIMEOUT = 60  # seconds for one run_python call
 ANSWER_BUDGET = 210  # wall-clock seconds before we force a final answer
+MAX_GIVEUP_RETRIES = 2  # extra rounds forced when the model tries to answer "I failed"
 
 _log_lock = threading.Lock()
 _histories: dict[int, list[dict]] = {}  # chat_id -> chat-completion messages
 _hist_lock = threading.Lock()
+_pyns: dict[int, dict] = {}  # chat_id -> persistent run_python globals
+_pyns_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------- logging
@@ -56,27 +58,47 @@ def log_event(**fields):
 
 
 # ---------------------------------------------------------------- tools
-def run_python(code: str) -> str:
-    """Execute Python code, return captured stdout (or the error)."""
+def run_python(code: str, chat_id: int = 0) -> str:
+    """Execute Python code, return captured stdout (or the error).
+
+    Globals persist per chat, so a later step can reuse a dataframe an earlier
+    step downloaded instead of refetching it.
+    """
     out = io.StringIO()
-    result: dict = {}
+    out_lock = threading.Lock()
+
+    # Capture output by giving the sandbox its own print(), NOT by redirecting
+    # sys.stdout: that is process-global, so with several chats in flight one
+    # chat would steal another's output, and a timed-out thread would leave the
+    # whole process writing into a dead buffer.
+    def _print(*args, sep=" ", end="\n", file=None, flush=False):
+        with out_lock:
+            out.write(sep.join(str(a) for a in args) + end)
+
+    with _pyns_lock:
+        env = _pyns.setdefault(chat_id, {"__name__": "__main__"})
+        if len(_pyns) > 50:  # bound memory across many chats
+            for k in list(_pyns)[:-20]:
+                _pyns.pop(k, None)
+    env["print"] = _print
 
     def target():
-        env = {"__name__": "__main__"}
         try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-                exec(code, env)
-            result["ok"] = True
-        except Exception:
-            result["ok"] = False
-            out.write("\n" + traceback.format_exc(limit=4))
+            exec(code, env)
+        except BaseException:  # SystemExit from exit() must not vanish silently
+            with out_lock:
+                out.write("\n" + traceback.format_exc(limit=4))
 
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(PY_TIMEOUT)
     if t.is_alive():
-        return "ERROR: code timed out after %ss" % PY_TIMEOUT
-    text = out.getvalue()
+        return (
+            "ERROR: code timed out after %ss. Pass timeout= to every network call, "
+            "fetch less data, and print only what you need." % PY_TIMEOUT
+        )
+    with out_lock:
+        text = out.getvalue()
     return text[-8000:] if text else "(no output — use print())"
 
 
@@ -89,7 +111,9 @@ TOOLS = [
                 "Run Python code on the server and get its printed output. "
                 "pandas, numpy, requests, bs4, openpyxl are installed and the "
                 "network is available (download public datasets with requests). "
-                "Always print() what you need to see."
+                "Always print() what you need to see. Variables persist between "
+                "calls in this chat, so data you fetched in an earlier call is "
+                "still in scope — inspect it instead of refetching."
             ),
             "parameters": {
                 "type": "object",
@@ -102,15 +126,106 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are an expert data-analyst agent answering questions sent to a Telegram bot.
 
-Rules:
-1. Work out the answer to the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks.
-2. The message may embed data inline, or reference a public dataset (MOSPI, data.gov.in, etc.). Use the run_python tool to fetch data and compute — do not guess numeric results you can compute. For well-known published statistics (e.g. "which state has the highest maternal mortality rate per MOSPI/SRS"), you may answer from reliable knowledge if fetching fails.
-3. The message usually spells out the exact JSON shape it wants, e.g. Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}.
-4. When you are ready to answer, reply with ONLY that JSON object — no prose, no markdown fences. Use a placeholder like "LOG_URL" for the log_url value; the harness substitutes the real URL. Match the requested shape for "answer" EXACTLY (keys, nesting, types: numbers as numbers unless a string is asked for).
-5. If the message does not specify a shape, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
-6. If a mid-conversation message is only setup/context ("I will send data next"), still reply with {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
-7. Round numbers as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for inside "answer".
+## The one unbreakable rule
+NEVER answer with a failure, an apology, or an excuse. Strings like "failed to fetch",
+"unable to determine", "data not available", "please check the API" are ALWAYS wrong answers —
+they score zero. The question always has a real answer and you must commit to one. If every
+fetch attempt fails, answer from your own knowledge of the published statistics instead. An
+educated best guess in the right shape beats a perfect explanation of why you could not answer.
+
+## Rules
+1. Answer the user's LATEST message. Earlier messages in the chat are context for multi-turn tasks.
+2. The message may embed data inline, or reference a public dataset (WHO GHO, World Bank, MOSPI,
+   data.gov.in, ...). Use the run_python tool to fetch and compute — never guess a number you could
+   compute. But see the unbreakable rule: fetching is the means, answering is the goal.
+3. The message usually spells out the exact JSON shape it wants, e.g.
+   Reply with ONLY {"answer": {"state": "<state>"}, "log_url": "..."}.
+4. When ready, reply with ONLY that JSON object — no prose, no markdown fences. Use the placeholder
+   "LOG_URL" for log_url; the harness substitutes the real URL. Match the requested "answer" shape
+   EXACTLY (keys, nesting, types: numbers as numbers unless a string is asked for).
+5. If no shape is specified, reply {"answer": <your concise answer>, "log_url": "LOG_URL"}.
+6. If a mid-conversation message is only setup/context ("I will send data next"), still reply with
+   {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
+7. Round as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for.
+
+## How to not fail at fetching
+An empty result is NOT proof the data is missing — it almost always means your identifier or filter
+was wrong. Before concluding anything is unavailable:
+- Fetch ONE unfiltered record first and print it, so you can see the real column/dimension names and
+  the exact value format. Filter only after you have seen the shape of the data.
+- Country/region codes are usually ISO3 ("BRA", "IND", "ZAF"), NOT country names. Same for state and
+  indicator codes — look up the code list endpoint rather than assuming a label works.
+- WHO GHO OData (ghoapi.azureedge.net): SpatialDim holds ISO3 codes, and rows are split by dimension —
+  e.g. Dim1 is SEX_BTSX (both sexes) / SEX_MLE / SEX_FMLE. Filter the dimension explicitly or you will
+  silently mix series together.
+- If a host or endpoint is dead, try an alternate source (World Bank API, the CSV download, Wikipedia)
+  before falling back to knowledge.
+- Never call max()/min()/idxmax() on a collection you have not just printed and confirmed is non-empty.
+- Print intermediate values at every step. Sanity-check the final number against what you'd expect.
+
+## Every qualifier in the question is a filter you must write
+"both sexes", "total population", "urban", "rural", "constant 2015 prices", "age-standardised",
+"seasonally adjusted" — each one names a specific slice of the data. If a qualifier from the question
+does not appear as an explicit filter in your code, you have NOT answered the question that was asked.
+Statistical datasets ship every slice in the same table.
+
+## The silent killer: many rows per key
+Before you collapse rows into one value per entity/year, PRINT how many rows exist per key, e.g.
+    from collections import Counter
+    print(Counter((r["SpatialDim"], r["TimeDim"]) for r in rows).most_common(5))
+If any count is above 1 you are mixing series (sex, age group, region type, data source) and
+`d[key] = value` silently keeps whichever row happened to come last. This produces a confident,
+wrong answer with no error message — it is the most common way this task is failed. Filter the
+extra dimensions until every key has exactly one row.
+
+## Before you send the final JSON
+1. Print the FULL comparison table you based the answer on — every candidate with its computed
+   value, sorted — not just the winner. Read it and check the winner really is the extreme.
+2. Re-read the question and confirm: right entity, right years, right qualifiers, right units,
+   right rounding, right key names and nesting.
+3. Confirm "answer" is an actual answer, not a status report.
 """
+
+# Answers that are really the model giving up. Matching one forces another round.
+GIVEUP_RE = re.compile(
+    r"\b(?:fail(?:ed|ure)?|unable|cannot|can'?t|could ?n'?t|not able|no data|"
+    r"not available|unavailable|missing data|error occurred|an error|sorry|"
+    r"apolog\w+|please (?:check|try|provide)|try again|unknown|undetermined|"
+    r"unable to determine|insufficient)\b",
+    re.I,
+)
+
+
+GIVEUP_NUDGE = (
+    "Your last reply was a failure message, not an answer. That scores zero.\n"
+    "If it actually WAS a valid answer to the question, resend it EXACTLY as it was.\n"
+    "Otherwise keep working: an empty API result means your identifier or filter was wrong, "
+    "not that the data is missing. Fetch one UNFILTERED record and print it to see the real "
+    "codes and dimension values (country codes are usually ISO3 like 'BRA'; rows are often split "
+    "by dimensions such as sex). Or switch to a different source. Or, if nothing can be fetched, "
+    "answer from your own knowledge of the published figures — you must commit to a real answer.\n"
+    "Now reply with ONLY the JSON object in the exact shape the question asked for."
+)
+
+
+def looks_like_giveup(obj) -> bool:
+    """True if the model's 'answer' is a failure message rather than an answer."""
+
+    def bad(v) -> bool:
+        if isinstance(v, str):
+            return bool(GIVEUP_RE.search(v))
+        if isinstance(v, dict):
+            return any(bad(x) for x in v.values())
+        if isinstance(v, (list, tuple)):
+            return any(bad(x) for x in v)
+        return False
+
+    if "answer" not in obj:
+        return False
+    a = obj["answer"]
+    if a is None:
+        return True
+    return bad(a)
 
 
 # ---------------------------------------------------------------- llm
@@ -177,50 +292,72 @@ def solve(chat_id: int, question: str) -> str:
 
     log_event(event="question", chat_id=chat_id, text=question)
 
-    final_text = None
     deadline = time.time() + ANSWER_BUDGET
-    for step in range(MAX_AGENT_STEPS):
-        out_of_time = time.time() > deadline
-        if out_of_time:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Time is up. Reply NOW with only your best final JSON object.",
-                }
-            )
-        try:
-            msg = chat_completion(messages, use_tools=not out_of_time)
-        except Exception as e:
-            log_event(event="llm_error", chat_id=chat_id, error=str(e))
-            time.sleep(2)
-            try:
-                msg = chat_completion(messages, use_tools=True)
-            except Exception as e2:
-                log_event(event="llm_error_final", chat_id=chat_id, error=str(e2))
-                break
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            messages.append(msg)
-            for tc in tool_calls:
-                try:
-                    code = json.loads(tc["function"]["arguments"]).get("code", "")
-                except json.JSONDecodeError:
-                    code = tc["function"]["arguments"]
-                log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:4000])
-                output = run_python(code)
-                log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:4000])
-                messages.append(
-                    {"role": "tool", "tool_call_id": tc["id"], "content": output}
-                )
-            continue
-        final_text = msg.get("content") or ""
-        break
+    step = 0
+    obj: dict = {"answer": "unable to determine"}
 
-    obj = extract_json(final_text) if final_text else None
-    if obj is None:
-        obj = {"answer": (final_text or "unable to determine").strip()[:1000]}
-    if "answer" not in obj:
-        obj = {"answer": obj}
+    for attempt in range(MAX_GIVEUP_RETRIES + 1):
+        final_text = None
+        while step < MAX_AGENT_STEPS:
+            out_of_time = time.time() > deadline
+            if out_of_time:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Time is up. Reply NOW with only your best final JSON object.",
+                    }
+                )
+            try:
+                msg = chat_completion(messages, use_tools=not out_of_time)
+            except Exception as e:
+                log_event(event="llm_error", chat_id=chat_id, error=str(e))
+                time.sleep(2)
+                try:
+                    msg = chat_completion(messages, use_tools=True)
+                except Exception as e2:
+                    log_event(event="llm_error_final", chat_id=chat_id, error=str(e2))
+                    break
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                messages.append(msg)
+                for tc in tool_calls:
+                    try:
+                        code = json.loads(tc["function"]["arguments"]).get("code", "")
+                    except json.JSONDecodeError:
+                        code = tc["function"]["arguments"]
+                    log_event(event="tool_call", chat_id=chat_id, step=step, code=code[:4000])
+                    output = run_python(code, chat_id)
+                    log_event(event="tool_result", chat_id=chat_id, step=step, output=output[:4000])
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc["id"], "content": output}
+                    )
+                step += 1
+                continue
+            final_text = msg.get("content") or ""
+            messages.append({"role": "assistant", "content": final_text})
+            step += 1
+            break
+
+        candidate = extract_json(final_text) if final_text else None
+        if candidate is None:
+            candidate = {"answer": (final_text or "unable to determine").strip()[:1000]}
+        if "answer" not in candidate:
+            candidate = {"answer": candidate}
+        obj = candidate
+
+        if not looks_like_giveup(obj):
+            break
+        if attempt == MAX_GIVEUP_RETRIES or step >= MAX_AGENT_STEPS or time.time() > deadline:
+            log_event(event="giveup_unrecovered", chat_id=chat_id, reply=json.dumps(obj)[:500])
+            break
+        log_event(
+            event="giveup_retry",
+            chat_id=chat_id,
+            attempt=attempt + 1,
+            rejected=json.dumps(obj, ensure_ascii=False)[:500],
+        )
+        messages.append({"role": "user", "content": GIVEUP_NUDGE})
+
     obj["log_url"] = LOG_URL
     reply = json.dumps(obj, ensure_ascii=False)
 
