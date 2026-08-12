@@ -178,6 +178,13 @@ educated best guess in the right shape beats a perfect explanation of why you co
    {"answer": "ok", "log_url": "LOG_URL"} unless it asks something.
 7. Round as instructed; if unspecified, give reasonable precision. Never add keys that were not asked for.
 
+## NEVER do arithmetic in your head
+Every number you report must come out of a run_python call — medians, means, sums, ratios, sorting,
+percentages, differences, rounding, "which is largest". No exceptions, however easy it looks: a median
+of six numbers you can "see" is exactly where a silent mistake happens, and you cannot check work you
+never wrote down. If the question embeds the data inline, put that data in a list and compute on it.
+Mental arithmetic is never faster in a way that matters — the grader waits.
+
 ## NEVER fabricate data (this is how wrong answers happen)
 Writing values you remember into a literal and computing on them is NOT computing — it is a guess
 wearing a computation's clothes, and it silently produces a different answer every time:
